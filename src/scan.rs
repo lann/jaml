@@ -23,6 +23,7 @@ enum TokenType {
     QuotedStringEnd,
 
     Dash,
+
     Colon,
     Question,
 
@@ -58,7 +59,7 @@ enum State {
     QuotedStringEscapeHex(u8),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Error {
     BadNumberFormat,
     BadStringEscape,
@@ -114,8 +115,8 @@ impl State {
 
                 b'-' => advance(DashOrMinus),
 
+                b'1'..=b'9' => token_start(TokenType::NumberStart, NumberIntDigit),
                 b'0' => Err(Error::BadNumberFormat),
-                b'0'..=b'9' => token_start(TokenType::NumberStart, NumberIntDigit),
 
                 b'n' => token_start(
                     TokenType::BareWordOrStringStart,
@@ -167,8 +168,8 @@ impl State {
 
             // '-'
             DashOrMinus => match byte {
+                b'1'..=b'9' => token_started(TokenType::NumberStart, NumberIntDigit),
                 b'0' => Err(Error::BadNumberFormat),
-                b'0'..=b'9' => token_started(TokenType::NumberStart, NumberIntDigit),
                 _ => token_ended(TokenType::Dash),
             },
 
@@ -208,25 +209,30 @@ impl State {
             },
 
             // Partially matched keyword ("null" | "true" | "false")
-            BareStringOrReserved(word, len) => match byte {
-                _ if word.get(len as usize) == Some(&byte) => {
+            BareStringOrReserved(word, len) => {
+                if word.get(len as usize) == Some(&byte) {
                     advance(BareStringOrReserved(word, len + 1))
-                }
-                _ if is_bare_word_rest(byte) => {
+                } else if is_bare_word_rest(byte) {
                     token_start(TokenType::BareStringContinue, BareString)
+                } else if word.len() == (len as usize) {
+                    token_ended(match word {
+                        NULL => TokenType::BareWordNullEnd,
+                        TRUE => TokenType::BareWordTrueEnd,
+                        FALSE => TokenType::BareWordFalseEnd,
+                        _ => unreachable!(),
+                    })
+                } else {
+                    token_ended(TokenType::BareStringEnd)
                 }
-                _ => token_ended(match word {
-                    NULL => TokenType::BareWordNullEnd,
-                    TRUE => TokenType::BareWordTrueEnd,
-                    FALSE => TokenType::BareWordFalseEnd,
-                    _ => TokenType::BareStringEnd,
-                }),
-            },
+            }
             // [a-zA-Z0-9_$./-]
-            BareString => match byte {
-                _ if is_bare_word_rest(byte) => advance(BareString),
-                _ => token_ended(TokenType::BareStringEnd),
-            },
+            BareString => {
+                if is_bare_word_rest(byte) {
+                    advance(BareString)
+                } else {
+                    token_ended(TokenType::BareStringEnd)
+                }
+            }
 
             // Inside double-quoted string but not in escape sequence.
             QuotedString => match byte {
@@ -242,15 +248,17 @@ impl State {
                 _ => Err(Error::BadStringEscape),
             },
             // "\u" [0-9a-fA-F]{digits}
-            QuotedStringEscapeHex(digits) => if byte.is_ascii_hexdigit() {
-                if digits == 3 {
-                    advance(QuotedString)
+            QuotedStringEscapeHex(digits) => {
+                if byte.is_ascii_hexdigit() {
+                    if digits == 3 {
+                        advance(QuotedString)
+                    } else {
+                        advance(QuotedStringEscapeHex(digits + 1))
+                    }
                 } else {
-                    advance(QuotedStringEscapeHex(digits + 1))
+                    Err(Error::BadStringEscape)
                 }
-            } else {
-                Err(Error::BadStringEscape)
-            },
+            }
         }
     }
 }
@@ -296,21 +304,110 @@ fn is_bare_word_rest(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use Error::*;
     use TokenType::*;
 
     #[test]
-    fn test_foo() {
-        assert_eq!(
-            tokens(b"  # abc\n"),
-            [SpacesStart, SpacesEnd, CommentStart, CommentEnd, Newline,]
+    fn test_spaces() {
+        assert_tokens(b"  ", &[SpacesStart, SpacesEnd])
+    }
+
+    #[test]
+    fn test_newline() {
+        assert_tokens(b"\r?\n:\r\n", &[Newline, Question, Newline, Colon, Newline]);
+    }
+
+    #[test]
+    fn test_comment() {
+        assert_tokens(b"# comment\n", &[CommentStart, CommentEnd, Newline]);
+    }
+
+    #[test]
+    fn test_bare_words() {
+        // Keywords
+        assert_tokens(b"null", &[BareWordOrStringStart, BareWordNullEnd]);
+        assert_tokens(b"true", &[BareWordOrStringStart, BareWordTrueEnd]);
+        assert_tokens(b"false", &[BareWordOrStringStart, BareWordFalseEnd]);
+
+        // Partial keyword matches
+        assert_tokens(b"n", &[BareWordOrStringStart, BareStringEnd]);
+        assert_tokens(b"nul", &[BareWordOrStringStart, BareStringEnd]);
+        assert_tokens(
+            b"nullx",
+            &[BareWordOrStringStart, BareStringContinue, BareStringEnd],
         );
     }
 
-    fn tokens(bytes: &[u8]) -> Vec<TokenType> {
+    #[test]
+    fn test_bare_string() {
+        assert_tokens(b"word", &[BareStringStart, BareStringEnd])
+    }
+
+    #[test]
+    fn test_number() {
+        assert_tokens(b"1", &[NumberStart, NumberEnd]);
+        assert_tokens(b"-1", &[NumberStart, NumberEnd]);
+        assert_tokens(b"9.01", &[NumberStart, NumberEnd]);
+        assert_tokens(b"1e5", &[NumberStart, NumberEnd]);
+        assert_tokens(b"1e-5", &[NumberStart, NumberEnd]);
+        assert_tokens(b"-123.456e+789", &[NumberStart, NumberEnd]);
+    }
+
+    #[test]
+    fn test_quoted_string() {
+        assert_tokens(br#""""#, &[QuotedStringStart, QuotedStringEnd]);
+        assert_tokens(br#""\"\n\u12aF""#, &[QuotedStringStart, QuotedStringEnd]);
+    }
+
+    #[test]
+    fn test_dash() {
+        assert_tokens(b"- ", &[Dash, SpacesStart, SpacesEnd]);
+    }
+
+    #[test]
+    fn test_single_byte_tokens() {
+        assert_tokens(b":?", &[Colon, Question]);
+        assert_tokens(b"{}", &[OpenCurly, CloseCurly]);
+        assert_tokens(b"[]", &[OpenSquare, CloseSquare]);
+    }
+
+    #[test]
+    fn test_bad_number_format() {
+        assert_error(b"0", BadNumberFormat);
+        assert_error(b"-0", BadNumberFormat);
+        assert_error(b"1.X", BadNumberFormat);
+        assert_error(b"1eX", BadNumberFormat);
+        assert_error(b"1e+X", BadNumberFormat);
+    }
+
+    #[test]
+    fn test_bad_string_escape() {
+        assert_error(br#""\z""#, BadStringEscape);
+        assert_error(br#""\u12""#, BadStringEscape);
+        assert_error(br#""\u12x4""#, BadStringEscape);
+    }
+
+    #[test]
+    fn test_bad_string_newline() {
+        assert_error(b"\"\n", BadStringNewline);
+    }
+
+    #[test]
+    fn test_unexpected_byte() {
+        assert_error(b"\xff", UnexpectedByte);
+        assert_error(b"%", UnexpectedByte);
+    }
+
+    #[test]
+    fn test_unexpected_end() {
+        assert_error(b"\"", UnexpectedEnd);
+    }
+
+    fn tokens(bytes: &[u8]) -> Result<Vec<TokenType>, Error> {
         let mut state = State::default();
         let mut tokens = vec![];
         for &byte in bytes {
-            let (token1, token2, next_state) = state.feed(byte).unwrap();
+            let (token1, token2, next_state) = state.feed(byte)?;
             if let Some(token_type) = token1 {
                 tokens.push(token_type);
             }
@@ -319,9 +416,17 @@ mod tests {
             }
             state = next_state;
         }
-        if let Some(token_type) = state.end().unwrap() {
+        if let Some(token_type) = state.end()? {
             tokens.push(token_type);
         }
-        tokens
+        Ok(tokens)
+    }
+
+    fn assert_tokens(bytes: &[u8], want: &[self::TokenType]) {
+        assert_eq!(tokens(bytes).unwrap(), want);
+    }
+
+    fn assert_error(bytes: &[u8], want: Error) {
+        assert_eq!(tokens(bytes).unwrap_err(), want);
     }
 }
